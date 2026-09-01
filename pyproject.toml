@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "s3flex_acaqua"
-version = "0.0.2"
+version = "0.0.1"
 description = "Prototype code to perform atmospheric correction of FLEX above water"
 readme = "pypi_README.rst"
 authors = [{ name = "Tristan Harmel", email = "tristan.harmel@gmail.com" }]
@@ -32,7 +32,7 @@ where = ["."]
 "*" = [".gitattributes"]
 
 [project.scripts]
-s3flex_acaqua = "s3flex_acaqua.run:main"
+#s3flex_acaqua = "s3flex_acaqua.run:main"
 
 #dynamic = ["dependencies"]
 [tool.setuptools.dynamic]
