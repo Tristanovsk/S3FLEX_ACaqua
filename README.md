@@ -1,6 +1,12 @@
 # RS3FLEX_ACaqua package
 ## Prototype code to perform atmospheric correction of FLEX above water
 
+### Principles
+![p](/static/principle_eq.png)
+
+![s](/static/toa_simu.png)
+
+
 ### Installation
 First install this package:
 https://github.com/Tristanovsk/radcalnet_oc

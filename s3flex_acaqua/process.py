@@ -44,6 +44,8 @@ class Process():
         wl_ref = 550
         ang_exp = l1_pt.A865
         aot_ref = l1_pt.T865 * (wl_ref / 865) ** -ang_exp
+        if aot_refs is None:
+            aot_refs=[aot_ref]
         wind = np.sqrt(
             l1_pt.horizontal_wind.isel(wind_vectors=0) ** 2 + l1_pt.horizontal_wind.isel(wind_vectors=1) ** 2).values
         pressure = float(l1_pt.sea_level_pressure.values)
@@ -68,7 +70,7 @@ class Process():
                  '\n$vza= %.1f$' % (vza) + \
                  '\n$razi= %.1f$' % (azi) + \
                  '\n$aot550 = %.3f$' % (aot_ref) + \
-                 '\n$ang.\ exp. = %.3f$' % (ang_exp) + \
+                 r'\n$ang.\ exp. = %.3f$' % (ang_exp) + \
                  '\n$pressure = %.1f$' % (pressure) + \
                  '\n$wind = %.1f$' % (wind) + \
                  '\n$tcwv = %.1f$' % (tcwv) + \
@@ -146,15 +148,15 @@ class Process():
         Tra_dir_u = np.exp(-(rot + aot) / np.cos(np.radians(vzas)))
 
         # get top-of-atmosphere reflectance or radiance
-        Ratm = Tg_d * Tg_u * lut.Rdiff_lut.squeeze().interp(wl=central_wl, method='quadratic')
+        self.Ratm = Tg_d * Tg_u * lut.Rdiff_lut.squeeze().interp(wl=central_wl, method='quadratic')
         Ed = Tra_d * Tg_d * E0
         Ed_ref = Ed.sel(wl=slice(400, 700)).mean()
 
         # get sunglint component
-        Iglint, Qglint, Uglint, Vglint = coxmunk.sunglint(sza, vza, azi, m=1.334).sunglint(
+        Iglint, Qglint, Uglint, Vglint = radoc.Sunglint(sza, vza, azi, m=1.334).sunglint(
             wind, wind_azi, stats=stats, shadow=shadow, slope=slope)
 
-        Rtoa_sunglint = Iglint * Tg_tot_d * Tg_tot_u * Tra_dir_d * Tra_dir_u
+        self.Rtoa_sunglint = Iglint * Tg_tot_d * Tg_tot_u * Tra_dir_d * Tra_dir_u
 
         # -------------------------------------
         # Spectral convolution and final step
@@ -163,11 +165,11 @@ class Process():
 
         central_wl = l1_pt.wl  # .values #np.arange(wl_min, wl_max,spectral_res)
         spectral = radoc.Spectral(central_wl, fwhm)
-        Ratm_sat = spectral.convolve(Ratm)
+        self.Ratm_sat = spectral.convolve(self.Ratm)
         #Tg_u_sat = spectral.convolve(Tg_tot_u)
         #Tg_d_sat = spectral.convolve(Tg_d)
-        Rtoa_sunglint_sat = spectral.convolve(Rtoa_sunglint.squeeze())
-        Rw_toa = l1_pt.Rtoa - (Rtoa_sunglint_sat + Ratm_sat)
+        self.Rtoa_sunglint_sat = spectral.convolve(self.Rtoa_sunglint.squeeze())
+        self.Rrs = l1_pt.Rtoa - (self.Rtoa_sunglint_sat + self.Ratm_sat)
 
-        return Rw_toa/np.pi
+        return
 
