@@ -1,175 +1,203 @@
+'''
+Atmospheric correction of a FLEX (or Sentinel-3 FLEX-mode) pixel above water from the atmospheric parameters
+of the Sentinel-3 L2A products, with the radiative transfer simulator radcalnet_oc (version >= 1.1).
 
-import os, shutil
-import glob
+The top-of-atmosphere reflectance is decomposed as (see the ATBD and https://radcalnet-oc.readthedocs.io)
+
+    R_toa = T_g^atm R_atm + T_dir R_sg + pi T_down t_up T_g^w R_rs
+
+with R_atm the diffuse reflectance of the atmosphere and of the sky reflected by the rough surface (OSOAA look-up
+tables), R_sg the Cox-Munk reflectance of the direct sunlight (sunglint), T_dir the direct transmittance of the
+Sun-surface-sensor path (gases, molecules, aerosols), T_down and t_up the diffuse transmittances, and T_g^atm,
+T_g^w the gaseous transmittances of the path reflectance and of the water-leaving term, coupled with the
+scattering (photon path-length model of radcalnet_oc 1.1, fitted on SOS-ABS simulations).
+'''
 
 import numpy as np
 import xarray as xr
-import pandas as pd
-import geopandas as gpd
-
-import datetime as dt
 
 import radcalnet_oc as radoc
-import coxmunk
+from radcalnet_oc.kernel import GasCoupling, GAS_COUPLING_FILE, GAS_COUPLING_PPLD_FILE
+
+#: largest viewing zenith angle of the look-up tables (deg)
+VZA_MAX = 48.91
+#: OPAC aerosol models of the look-up tables
+AEROSOL_MODELS = ['ARCT_rh70', 'COAV_rh70', 'DESE_rh70', 'MACL_rh70', 'URBA_rh70', 'WASO_rh0']
+COUPLING_TABLES = {'path_length': GAS_COUPLING_PPLD_FILE, 'effective_air_mass': GAS_COUPLING_FILE}
+
 
 class Process():
-    def __init__(self):
-        pass
+    '''
+    Atmospheric correction of one pixel.
+
+    :param gas_coupling: gaseous transmittance of the scattered light, as in radcalnet_oc.Process:
+        'path_length' (default), 'effective_air_mass' or 'decoupled' (direct-beam transmittance for all the terms)
+    :param o2_model: absorption of O2, 'lbl' (line by line in the O2-B and O2-A bands, default) or 'reptran'
+
+    After :py:meth:`execute`, the attributes are (dimension ``aot_ref`` for the aerosol optical thicknesses
+    simulated, ``wl`` the wavelengths of the hyperspectral simulation or of the sensor bands for ``*_sat``):
+
+    - ``Ratm``, ``Rtoa_sunglint``: atmospheric reflectance T_g^atm R_atm and sunglint T_dir R_sg at the TOA
+      (hyperspectral), and ``Ratm_sat``, ``Rtoa_sunglint_sat`` in the sensor bands;
+    - ``trans_w``, ``trans_w_sat``: pi T_down t_up T_g^w, from R_rs to the water term at the TOA;
+    - ``Rw_toa``: water-leaving term at the TOA, R_toa - R_atm - R_sunglint (sensor bands);
+    - ``Rrs``: remote-sensing reflectance (sr-1, sensor bands);
+    - ``Ed``: downwelling irradiance at the surface (mW m-2 nm-1, hyperspectral) and ``PAR``
+      (umol photons m-2 s-1);
+    - ``Rsg``: sunglint reflectance at the surface; ``params``: text of the input parameters for the figures.
+    '''
+
+    def __init__(self, gas_coupling='path_length', o2_model='lbl'):
+        if gas_coupling not in ('path_length', 'effective_air_mass', 'decoupled'):
+            raise ValueError(f'unknown gas_coupling {gas_coupling!r}')
+        self.gas_coupling = gas_coupling
+        self.o2_model = o2_model
 
     def execute(self,
-                 l1_pt,
+                l1_pt,
                 wl_min=350,
-                wl_max = 1000,
-                expon = 2,
-                spectral_res = 0.1,
-
-                # set aerosol optical thickness
-                aot_refs = None, # 0.8*aot_ref.values,aot_ref.values,1.2*aot_ref.values]
-                # ['ARCT_rh70', 'COAV_rh70', 'DESE_rh70', 'MACL_rh70', 'URBA_rh70', 'WASO_rh0']
-                aerosol_combination = [1., 0., 0., 0., 0., 0.],
-
-
+                wl_max=1000,
+                expon=2,
+                spectral_res=0.1,
+                fwhm_hyp=0.3,
+                # aerosol optical thicknesses at 550 nm to simulate (default: that of the L2A product)
+                aot_refs=None,
+                # proportions of the aerosol models, see AEROSOL_MODELS
+                aerosol_combination=[1., 0., 0., 0., 0., 0.],
                 # sunglint parameters
                 wind_azi=0,
-                stats = 'cm_iso',  # 'bh2006' #
-                shadow = False,
-                slope = False
-
-                 ):
-
-        ##################################################
-        # Input parameters
-        ##################################################
-
+                stats='cm_iso',  # 'bh2006', 'cm_dir'
+                shadow=False,
+                slope=False):
+        '''
+        :param l1_pt: pixel of the co-registered L1 (``Rtoa``, ``wl``, ``fwhm``, geometry ``sza``, ``vza``,
+            ``raa``) and Sentinel-3 L2A (``T865``, ``A865``, ``horizontal_wind``, ``sea_level_pressure``,
+            ``total_ozone``, ``total_columnar_water_vapour``) products
+        :param wl_min, wl_max: spectral range of the hyperspectral simulation (nm)
+        :param expon: exponent of the super-Gaussian responses of the hyperspectral simulation (2: Gaussian)
+        :param spectral_res: sampling of the hyperspectral simulation (nm)
+        :param fwhm_hyp: full width at half maximum of the hyperspectral simulation (nm)
+        '''
+        # ------------------------------------------------------------------------------------------------
+        # input parameters
+        # ------------------------------------------------------------------------------------------------
         wl_ref = 550
-        ang_exp = l1_pt.A865
-        aot_ref = l1_pt.T865 * (wl_ref / 865) ** -ang_exp
+        ang_exp = float(l1_pt.A865)
+        aot_ref = float(l1_pt.T865) * (wl_ref / 865) ** -ang_exp
         if aot_refs is None:
-            aot_refs=[aot_ref]
-        wind = np.sqrt(
-            l1_pt.horizontal_wind.isel(wind_vectors=0) ** 2 + l1_pt.horizontal_wind.isel(wind_vectors=1) ** 2).values
+            aot_refs = [aot_ref]
+        aot_refs = np.atleast_1d(np.asarray(aot_refs, dtype=float))
+        wind = float(np.sqrt(l1_pt.horizontal_wind.isel(wind_vectors=0) ** 2 +
+                             l1_pt.horizontal_wind.isel(wind_vectors=1) ** 2))
         pressure = float(l1_pt.sea_level_pressure.values)
         tco3 = float(l1_pt.total_ozone.values)
         tcwv = float(l1_pt.total_columnar_water_vapour.values)
-        fwhm = l1_pt.fwhm.values
-        sza = float(l1_pt.sza.values)  # np.arange(10,90,10)
-        vza = float(l1_pt.vza.values)  # [0,20,40]
-        # warning LUT implemented until VZA=48.92
-        # take 48.91 if vza >48.92
-        vza = np.min([vza, 48.91])
+        sza = float(l1_pt.sza.values)
+        # the look-up tables stop at VZA = 48.92 deg
+        vza = min(float(l1_pt.vza.values), VZA_MAX)
         azi = float(l1_pt.raa.values)
+        # azimuth of the radiative transfer convention of the look-up tables (0: towards the Sun)
         azi_rt = (180 - azi) % 360
-        szas = [sza]  # np.arange(10,90,10)
-        vzas = [vza]  # [0,20,40]
-        azis = [azi]
+        day_of_year = int(l1_pt.time.dt.dayofyear) if 'time' in l1_pt.coords else 172
         tcno2 = 3e-6 / 100
         tcch4 = 1e-2
+        self.inputs = dict(sza=sza, vza=vza, azi=azi, aot550=aot_ref, ang_exp=ang_exp, pressure=pressure,
+                           wind=wind, tcwv=tcwv, tco3=tco3, day_of_year=day_of_year)
+        self.params = (r'$sza= %.1f$' % sza + '\n$vza= %.1f$' % vza + '\n$razi= %.1f$' % azi +
+                       '\n$aot550 = %.3f$' % aot_ref + '\n$ang.\\ exp. = %.3f$' % ang_exp +
+                       '\n$pressure = %.1f$' % pressure + '\n$wind = %.1f$' % wind +
+                       '\n$tcwv = %.1f$' % tcwv + '\n$tco3 = %.1e$' % tco3)
 
-        ##################################################
-        self.params = r'$sza= %.1f$' % (sza) + \
-                 '\n$vza= %.1f$' % (vza) + \
-                 '\n$razi= %.1f$' % (azi) + \
-                 '\n$aot550 = %.3f$' % (aot_ref) + \
-                 r'\n$ang.\ exp. = %.3f$' % (ang_exp) + \
-                 '\n$pressure = %.1f$' % (pressure) + \
-                 '\n$wind = %.1f$' % (wind) + \
-                 '\n$tcwv = %.1f$' % (tcwv) + \
-                 '\n$tco3 = %.1e$' % (tco3)
-
-        # -------------------------------------
-        # LUT preparation
-        # -------------------------------------
+        # ------------------------------------------------------------------------------------------------
+        # look-up tables: diffuse reflectance and transmittances (wind speed of the L2A product)
+        # ------------------------------------------------------------------------------------------------
         central_wl = np.arange(wl_min, wl_max, spectral_res)
-        spectral = radoc.Spectral(central_wl, 0.3)
+        spectral = radoc.Spectral(central_wl, fwhm_hyp)
         lut = radoc.LUT(wl=central_wl)
         lut.load_auxiliary_data()
-        lut.lut_preparation(aot_refs=aot_refs, sza=szas, vza=vzas, azi=[azi_rt],
+        lut.lut_preparation(wind=wind, aot_refs=aot_refs, sza=[sza], vza=[vza], azi=[azi_rt],
                             aerosol_combination=aerosol_combination)
-        gas_trans = radoc.GaseousTransmittance(lut.gas_lut)
+        self.lut = lut
+        mu0, muv = np.cos(np.radians(sza)), np.cos(np.radians(vza))
+        m0, m = 1. / mu0, 1. / mu0 + 1. / muv
+        aot = xr.DataArray(aot_refs, coords={'aot_ref': aot_refs}, dims='aot_ref')
 
-        #-------------------------------------
-        # simple process
-        # -------------------------------------
+        margin = 5 * fwhm_hyp + 1.
 
-        szas = lut.Rdiff_lut.sza
-        mu0 = np.cos(np.radians(szas))
+        def hyp(signal):
+            '''Signal at the resolution of the hyperspectral simulation (cropped first, to limit the memory).'''
+            signal = signal.sel(wl=slice(wl_min - margin, wl_max + margin))
+            out = spectral.convolve2(signal.rename('signal'), expon=expon)
+            out = out[list(out.data_vars)[0]] if isinstance(out, xr.Dataset) else out
+            return out.squeeze(drop=True)
 
-        # set total transmittance values
-        gas_trans = radoc.GaseousTransmittance(lut.gas_lut)
-        gas_trans.pressure = pressure
-        gas_trans.gas_tc['h2o'] = tcwv
-        gas_trans.gas_tc['o3'] = tco3
-        gas_trans.gas_tc['ch4'] = tcch4
+        # ------------------------------------------------------------------------------------------------
+        # gaseous transmittances
+        # ------------------------------------------------------------------------------------------------
+        gas = radoc.GaseousTransmittance(lut.gas_lut, o2_model=self.o2_model)
+        gas.pressure = pressure
+        gas.gas_tc['h2o'] = tcwv
+        gas.gas_tc['o3'] = tco3
+        gas.gas_tc['ch4'] = tcch4
+        gas.gas_tc['no2'] = tcno2
+        # direct beam of the Sun-surface-sensor path (sunglint)
+        gas.air_mass = m
+        Tg_dir = gas.get_gaseous_transmittance()
+        if self.gas_coupling == 'decoupled':
+            Tg_atm = Tg_w = Tg_dir
+            gas.air_mass = m0
+            Tg_Ed = gas.get_gaseous_transmittance()
+        else:
+            coupling = GasCoupling(COUPLING_TABLES[self.gas_coupling])
+            Tg_atm = gas.get_coupled_transmittance(m, 'atm', aot, coupling)
+            Tg_w = gas.get_coupled_transmittance(m, 'w', aot, coupling)
+            Tg_Ed = gas.get_coupled_transmittance(m0, 'Ed', aot, coupling)
+        Tg_dir, Tg_atm, Tg_w, Tg_Ed = (hyp(T) for T in (Tg_dir, Tg_atm, Tg_w, Tg_Ed))
+        self.Tg = xr.Dataset({'Tg_dir': Tg_dir, 'Tg_atm': Tg_atm, 'Tg_w': Tg_w, 'Tg_Ed': Tg_Ed})
 
-        # for diffuse radiance
-        gas_trans.coef_abs_scat['h2o'] = 0.5
-        gas_trans.coef_abs_scat['ch4'] = 1
-        gas_trans.coef_abs_scat['o2'] = 0.25
-
-        gas_trans.air_mass = 1. / mu0
-        Tg_d = gas_trans.get_gaseous_transmittance()
-
-        gas_trans.air_mass = 1. / np.cos(np.radians(vzas))
-        Tg_u = gas_trans.get_gaseous_transmittance()
-
-        # for total path
-        gas_trans.coef_abs_scat['h2o'] = 1
-        gas_trans.coef_abs_scat['ch4'] = 1
-        gas_trans.coef_abs_scat['o2'] = 1
-
-        gas_trans.air_mass = 1. / mu0
-        Tg_tot_d = gas_trans.get_gaseous_transmittance()
-
-        gas_trans.air_mass = 1. / np.cos(np.radians(vzas))
-        Tg_tot_u = gas_trans.get_gaseous_transmittance()
-
-        # get solar irradiance
+        # ------------------------------------------------------------------------------------------------
+        # solar irradiance and transmittances of the Rayleigh-aerosol atmosphere
+        # ------------------------------------------------------------------------------------------------
         solar_irr = radoc.SolarIrradiance()
-        signal = solar_irr.tsis.sel(wl=slice(350, 2500))
-        E0 = signal * mu0
-        wl_common = E0.wl.values
+        # on the grid of the gaseous absorption table: one weight matrix for all the convolutions
+        F0 = hyp(solar_irr.tsis.interp(wl=gas.gas_lut.wl.sel(wl=slice(wl_min - margin, wl_max + margin))))
+        E0 = mu0 * radoc.Misc.earth_sun_correction(day_of_year) * F0
+        Tra_d = lut.trans_Ed.interp(wl=central_wl, method='quadratic').squeeze(drop=True)
+        tra_u = lut.trans_Lu.interp(wl=central_wl, method='quadratic').squeeze(drop=True)
+        tau_a = lut.aot_lut.interp(wl=central_wl, method='quadratic').squeeze(drop=True)
+        tau_r = lut.rot.interp(wl=central_wl, method='quadratic') * pressure / 1013.25
+        Tdir = Tg_dir * np.exp(-(tau_r + tau_a) * m)
 
-        F0 = spectral.convolve2(solar_irr.tsis, expon=expon)
-        E0 = mu0 * F0
-        Tg_d = spectral.convolve2(Tg_d, expon=expon).to_dataarray().squeeze(drop=True)
-        Tg_u = spectral.convolve2(Tg_u, expon=expon)
-        Tg_tot_d = spectral.convolve2(Tg_tot_d, expon=expon).to_dataarray().squeeze(drop=True)
-        Tg_tot_u = spectral.convolve2(Tg_tot_u, expon=expon)
+        # ------------------------------------------------------------------------------------------------
+        # terms of the TOA reflectance and downwelling irradiance (hyperspectral)
+        # ------------------------------------------------------------------------------------------------
+        Rdiff = lut.Rdiff_lut.squeeze(drop=True).interp(wl=central_wl, method='quadratic')
+        self.Ratm = Tg_atm * Rdiff
+        Rsg = radoc.Sunglint(sza, vza, azi, m=1.334).sunglint(wind, wind_azi, stats=stats, shadow=shadow,
+                                                             slope=slope)[0]
+        self.Rsg = max(float(Rsg), 0.)
+        self.Rtoa_sunglint = Tdir * self.Rsg
+        self.trans_w = np.pi * Tra_d * tra_u * Tg_w
+        self.E0 = E0
+        self.Ed = Tra_d * Tg_Ed * E0
+        PAR = np.atleast_1d(radoc.Radiometry().PAR(self.Ed))
+        self.PAR = (xr.DataArray(PAR, coords={'aot_ref': aot_refs}, dims='aot_ref') if PAR.size == aot_refs.size
+                    else xr.DataArray(PAR.squeeze())).rename('PAR')
 
-        # get transmittance Rayleigh + aerosols
-        Tra_d = lut.trans_Ed.interp(wl=central_wl, method='quadratic')
-        Tra_u = lut.trans_Eu.interp(wl=central_wl, method='quadratic')
-        tra_u = lut.trans_Lu.interp(wl=central_wl, method='quadratic')
+        # ------------------------------------------------------------------------------------------------
+        # sensor bands and water-leaving signal
+        # ------------------------------------------------------------------------------------------------
+        sat = radoc.Spectral(l1_pt.wl, l1_pt.fwhm.values)
 
-        # get transmittance Rayleigh + aerosols for direct light (e.g., sunglint)
-        aot = lut.aot_lut.interp(wl=central_wl, method='quadratic')
-        rot = lut.rot.interp(wl=central_wl, method='quadratic') * pressure / 1013.25
-        Tra_dir_d = np.exp(-(rot + aot) / mu0)
-        Tra_dir_u = np.exp(-(rot + aot) / np.cos(np.radians(vzas)))
+        def bands(signal):
+            out = sat.convolve(signal)
+            if isinstance(out, xr.Dataset):
+                out = out[list(out.data_vars)[0]]
+            return out.squeeze('variable', drop=True) if 'variable' in out.dims else out
 
-        # get top-of-atmosphere reflectance or radiance
-        self.Ratm = Tg_d * Tg_u * lut.Rdiff_lut.squeeze().interp(wl=central_wl, method='quadratic')
-        Ed = Tra_d * Tg_d * E0
-        Ed_ref = Ed.sel(wl=slice(400, 700)).mean()
-
-        # get sunglint component
-        Iglint, Qglint, Uglint, Vglint = radoc.Sunglint(sza, vza, azi, m=1.334).sunglint(
-            wind, wind_azi, stats=stats, shadow=shadow, slope=slope)
-
-        self.Rtoa_sunglint = Iglint * Tg_tot_d * Tg_tot_u * Tra_dir_d * Tra_dir_u
-
-        # -------------------------------------
-        # Spectral convolution and final step
-        # -------------------------------------
-        fwhm = l1_pt.fwhm.values
-
-        central_wl = l1_pt.wl  # .values #np.arange(wl_min, wl_max,spectral_res)
-        spectral = radoc.Spectral(central_wl, fwhm)
-        self.Ratm_sat = spectral.convolve(self.Ratm)
-        #Tg_u_sat = spectral.convolve(Tg_tot_u)
-        #Tg_d_sat = spectral.convolve(Tg_d)
-        self.Rtoa_sunglint_sat = spectral.convolve(self.Rtoa_sunglint.squeeze())
-        self.Rrs = l1_pt.Rtoa - (self.Rtoa_sunglint_sat + self.Ratm_sat)
-
-        return
-
+        self.Ratm_sat = bands(self.Ratm)
+        self.Rtoa_sunglint_sat = bands(self.Rtoa_sunglint)
+        self.trans_w_sat = bands(self.trans_w)
+        self.Rw_toa = l1_pt.Rtoa - (self.Ratm_sat + self.Rtoa_sunglint_sat)
+        self.Rrs = self.Rw_toa / self.trans_w_sat
+        return self
