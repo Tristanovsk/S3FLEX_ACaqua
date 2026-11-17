@@ -21,6 +21,7 @@ dynamic = ["dependencies"]
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["s3flex_acaqua*"]
 
 [tool.setuptools.package-data]
 "s3flex_acaqua"= ['*.yml',
