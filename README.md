@@ -40,4 +40,24 @@ l2a_pt = s3flex_acaqua.Process().execute(l1_pt, aot_refs=[0.05, 0.1], aerosol_co
 l2a_pt.Rrs, l2a_pt.Ed, l2a_pt.PAR
 ```
 
+#### Whole raster
+The radiative transfer is solved at nodes every `step` pixels for a grid of aerosol optical thicknesses (in parallel
+over processes with dask), then interpolated to all the pixels (bilinear in space, linear in aerosol optical
+thickness) with the exact sunglint of each pixel (dask array, numba kernel):
+```python
+import xarray as xr
+from s3flex_acaqua import raster
+
+prod = xr.open_zarr(path, decode_coords='all')  # co-registered L1 and L2A products (y, x, wl)
+nodes = raster.solve_nodes(prod, step=32, num_workers=20,
+                           execute_kwargs={'aerosol_combination': [0, 0, 1, 0, 0, 0]})
+nodes.to_netcdf('nodes.nc')
+raster.apply_nodes(prod, nodes).to_zarr('l2.zarr')  # Rrs, Rw_toa, PAR, Rsg, aot550, aot_clipped
+```
+On an OLCI scene of 4065 x 4865 pixels (7 million water pixels), with 20 workers on a shared 40-core machine: nodes
+(step 64: 3527 nodes over water) in 20 min, interpolation of the whole scene in 1.6 min. Difference with
+`Process.execute` at 40 random water pixels: max 3.2e-5 sr-1 (median 5e-7 sr-1) with step 64; the step 32 (default)
+divides the interpolation error by ~4 for ~3.5 times more nodes. Only the isotropic Cox-Munk sunglint without
+shadowing (the defaults) is supported.
+
 The notebook `notebook/atbd_v1.1_figures.ipynb` makes the figures of the ATBD V1.1 from a Sentinel-3 FLEX-mode image.

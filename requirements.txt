@@ -1,3 +1,7 @@
 numpy
+scipy
 xarray
+dask
+numba
+threadpoolctl
 radcalnet_oc>=1.1
