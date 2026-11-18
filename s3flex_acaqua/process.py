@@ -129,7 +129,8 @@ class Process():
     - ``Rrs``: remote-sensing reflectance (sr-1, sensor bands);
     - ``Ed``: downwelling irradiance at the surface (mW m-2 nm-1, hyperspectral) and ``PAR``
       (umol photons m-2 s-1);
-    - ``Rsg``: sunglint reflectance at the surface; ``params``: text of the input parameters for the figures.
+    - ``Rsg``: sunglint reflectance at the surface and ``Tdir_sat`` the direct transmittance in the sensor bands
+      (``Rtoa_sunglint_sat = Tdir_sat * Rsg``); ``params``: text of the input parameters for the figures.
 
     The look-up tables and the spectral operators are built at the first call of :py:meth:`execute` and kept
     for the following calls (also by the other instances, see :py:func:`clear_cache`). The instances are not
@@ -293,6 +294,8 @@ class Process():
         self.Ratm_sat = bands(self.Ratm)
         self.Rtoa_sunglint_sat = bands(self.Rtoa_sunglint)
         self.trans_w_sat = bands(self.trans_w)
+        # direct transmittance in the bands: Rtoa_sunglint_sat = Tdir_sat * Rsg (Rsg does not depend on wl)
+        self.Tdir_sat = bands(Tdir)
         self.Rw_toa = l1_pt.Rtoa - (self.Ratm_sat + self.Rtoa_sunglint_sat)
         self.Rrs = self.Rw_toa / self.trans_w_sat
         return self
